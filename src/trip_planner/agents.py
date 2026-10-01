@@ -16,9 +16,15 @@ class TripAgents:
     reviewer: Agent
 
 
-def create_agents(llm: LLM, destination: GeocodeResult) -> TripAgents:
+def create_agents(
+    llm: LLM,
+    destination: GeocodeResult,
+    interests: tuple[str, ...] = (),
+) -> TripAgents:
     """Один LLM на всех; исследователю — Overpass, планировщику — OSRM driving."""
-    researcher_tools: list[BaseTool] = build_researcher_tools(destination)
+    researcher_tools: list[BaseTool] = build_researcher_tools(
+        destination, interests
+    )
     planner_tools: list[BaseTool] = build_planner_tools(destination)
     researcher = Agent(
         role="Исследователь направления и идей",

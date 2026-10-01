@@ -6,9 +6,12 @@ from crewai.tools import BaseTool, tool
 
 from .geocode import GeocodeResult, settlement_name
 from .places_osm import (
+    OSM_INTEREST_NOT_FOUND,
     PlacesError,
+    jiu_jitsu_interests,
     place_category_label,
     place_display_name,
+    place_matches_jiu_jitsu,
     search_places,
 )
 from .routes_osrm import ROUTE_SOURCE_LABEL, RoutesError, travel_time
@@ -22,11 +25,15 @@ def format_map_coordinates(latitude: float, longitude: float) -> str:
     return f"{latitude:.5f}, {longitude:.5f}"
 
 
-def build_researcher_tools(destination: GeocodeResult) -> list[BaseTool]:
+def build_researcher_tools(
+    destination: GeocodeResult,
+    interests: tuple[str, ...] = (),
+) -> list[BaseTool]:
     """Поиск достопримечательностей Overpass вокруг выбранного центра."""
     center_latitude = destination.latitude
     center_longitude = destination.longitude
     center_name = settlement_name(destination)
+    selected_interests = tuple(interests)
 
     @tool("search_attractions_near_destination")
     def search_attractions_near_destination() -> str:
@@ -34,33 +41,51 @@ def build_researcher_tools(destination: GeocodeResult) -> list[BaseTool]:
 
         Возвращает только места с названием, OSM ID, координатами и расстоянием
         до центра в пределах настроенного радиуса. Новые места не выдумывает.
+        Для интересов джиу-джитсу и BJJ добавляет подходящие объекты OSM.
         """
         try:
-            places = search_places(center_latitude, center_longitude)
+            places = search_places(
+                center_latitude,
+                center_longitude,
+                interests=selected_interests,
+            )
         except PlacesError as error:
             return f"Ошибка Overpass: {error.message}"
-        if not places:
-            return (
+        martial = [place for place in places if place_matches_jiu_jitsu(place)]
+        shown = places[:_MAX_PLACES]
+        shown_ids = {(place.osm_type, place.osm_id) for place in shown}
+        for place in martial:
+            if (place.osm_type, place.osm_id) not in shown_ids:
+                shown.append(place)
+                shown_ids.add((place.osm_type, place.osm_id))
+        if not shown:
+            lines = [
                 "В радиусе поиска Overpass не нашёл достопримечательностей "
                 "с именем, координатами и OSM ID."
-            )
-        lines = [
-            f"Найдено мест: {min(len(places), _MAX_PLACES)} "
-            f"(центр {center_name}: {center_latitude:.5f}, {center_longitude:.5f})."
-        ]
-        for place in places[:_MAX_PLACES]:
-            lines.append(
-                f"- {place_display_name(place)} | {place.osm_type}/{place.osm_id} | "
-                f"{place.distance_m:.0f} м | {place_category_label(place.category)}"
-            )
-            lines.append(
-                format_map_coordinates(place.latitude, place.longitude)
-            )
-        if len(places) > _MAX_PLACES:
-            lines.append(
-                f"… и ещё {len(places) - _MAX_PLACES} мест ближе к краю радиуса "
-                "(не показаны)."
-            )
+            ]
+        else:
+            lines = [
+                f"Найдено мест: {len(shown)} "
+                f"(центр {center_name}: {center_latitude:.5f}, {center_longitude:.5f})."
+            ]
+            for place in shown:
+                lines.append(
+                    f"- {place_display_name(place)} | {place.osm_type}/{place.osm_id} | "
+                    f"{place.distance_m:.0f} м | {place_category_label(place.category)}"
+                )
+                lines.append(
+                    format_map_coordinates(place.latitude, place.longitude)
+                )
+            hidden = len(places) - len(shown)
+            if hidden > 0:
+                lines.append(
+                    f"… и ещё {hidden} мест ближе к краю радиуса (не показаны)."
+                )
+        for interest in jiu_jitsu_interests(selected_interests):
+            if not martial:
+                lines.append(
+                    f"По интересу «{interest}»: {OSM_INTEREST_NOT_FOUND}"
+                )
         return "\n".join(lines)
 
     return [search_attractions_near_destination]

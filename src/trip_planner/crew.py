@@ -12,7 +12,7 @@ from .trip import TripRequest
 def create_crew(trip: TripRequest, destination: GeocodeResult) -> Crew:
     """Собирает последовательную команду. Запрос к модели не отправляет."""
     llm = create_llm()
-    agents = create_agents(llm, destination)
+    agents = create_agents(llm, destination, trip.interests)
     tasks = create_tasks(trip, agents, destination)
     return Crew(
         agents=[agents.researcher, agents.planner, agents.reviewer],

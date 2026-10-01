@@ -1,14 +1,18 @@
 """Поиск достопримечательностей через Overpass около заданного центра.
 
-Запрос ограничен радиусом и узким набором тегов OSM. После ответа каждый
-объект повторно проверяется по расстоянию до центра. В результат попадают
-только точки с координатами и OSM ID. CrewAI здесь не используется.
+Запрос ограничен радиусом и узким набором тегов OSM. Для интересов
+джиу-джитсу и BJJ в тот же радиус добавляются sport=jiu-jitsu,
+sport=martial_arts и залы только с таким тегом или явным названием.
+После ответа каждый объект повторно проверяется по расстоянию до центра.
+В результат попадают только точки с координатами и OSM ID.
+CrewAI здесь не используется.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 import time
 import unicodedata
 import urllib.error
@@ -39,6 +43,22 @@ ATTRACTION_TAGS: tuple[tuple[str, str], ...] = (
     ("natural", "beach"),
     ("leisure", "nature_reserve"),
 )
+
+# Залы ищем только вместе с sport-тегом или явным названием джиу-джитсу/BJJ.
+_JIU_JITSU_HALL_TAGS: tuple[tuple[str, str], ...] = (
+    ("amenity", "dojo"),
+    ("leisure", "fitness_centre"),
+    ("leisure", "sports_centre"),
+    ("leisure", "sports_hall"),
+)
+_JIU_JITSU_SPORTS = frozenset({"jiu-jitsu", "martial_arts"})
+_JIU_JITSU_NAME_RE = re.compile(
+    r"джиу[\s\-–—]*джитсу|jiu[\s\-–—]*jitsu|(?<![0-9a-zа-яё])bjj(?![0-9a-zа-яё])",
+    re.IGNORECASE,
+)
+
+# Фраза для поручений, если по интересу нет объекта в ответе OSM.
+OSM_INTEREST_NOT_FOUND = "не найдено в OpenStreetMap"
 
 _last_request_at = 0.0
 
@@ -104,17 +124,30 @@ class Place:
     tags: tuple[tuple[str, str], ...] = ()
 
 
+def jiu_jitsu_interests(interests: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Интересы «джиу-джитсу», «бразильское джиу-джитсу» и BJJ."""
+    return tuple(item for item in interests if _interest_is_jiu_jitsu(item))
+
+
+def place_matches_jiu_jitsu(place: Place) -> bool:
+    """Объект с sport=jiu-jitsu / martial_arts или зал с таким названием."""
+    return _matches_jiu_jitsu(dict(place.tags))
+
+
 def search_places(
     latitude: float,
     longitude: float,
     radius_m: int | None = None,
     *,
     settings: OsmSettings | None = None,
+    interests: tuple[str, ...] | list[str] | None = None,
 ) -> list[Place]:
     """Найти достопримечательности в радиусе от центра.
 
     Сначала Overpass ограничивает выборку around-радиусом, затем каждый
     элемент отбрасывается, если расстояние до центра больше radius_m.
+    Для интересов джиу-джитсу в тот же радиус добавляются sport=jiu-jitsu,
+    sport=martial_arts и залы только с этими тегами или явным названием.
     """
     if not math.isfinite(latitude) or not math.isfinite(longitude):
         raise PlacesError("Координаты центра должны быть конечными числами.")
@@ -126,11 +159,24 @@ def search_places(
     if type(radius) is not int or radius < 1:
         raise PlacesError("Радиус должен быть целым числом метров не меньше 1.")
 
-    elements = _fetch_overpass(latitude, longitude, radius, resolved)
+    include_jiu_jitsu = bool(jiu_jitsu_interests(interests or ()))
+    elements = _fetch_overpass(
+        latitude,
+        longitude,
+        radius,
+        resolved,
+        include_jiu_jitsu=include_jiu_jitsu,
+    )
     places: list[Place] = []
     seen: set[tuple[str, int]] = set()
     for element in elements:
-        place = _element_to_place(element, latitude, longitude, radius)
+        place = _element_to_place(
+            element,
+            latitude,
+            longitude,
+            radius,
+            include_jiu_jitsu=include_jiu_jitsu,
+        )
         if place is None:
             continue
         key = (place.osm_type, place.osm_id)
@@ -163,6 +209,8 @@ def _element_to_place(
     center_lat: float,
     center_lon: float,
     radius_m: int,
+    *,
+    include_jiu_jitsu: bool = False,
 ) -> Place | None:
     osm_type = element.get("type")
     osm_id = element.get("id")
@@ -187,7 +235,7 @@ def _element_to_place(
     name = str(tags.get("name") or tags.get("name:en") or "").strip()
     if not name:
         return None
-    category = _category_from_tags(tags)
+    category = _category_from_tags(tags, include_jiu_jitsu=include_jiu_jitsu)
     if category is None:
         return None
     tag_pairs = tuple(
@@ -226,11 +274,58 @@ def _element_coordinates(
     return None, None
 
 
-def _category_from_tags(tags: dict[str, Any]) -> str | None:
+def _category_from_tags(
+    tags: dict[str, Any],
+    *,
+    include_jiu_jitsu: bool = False,
+) -> str | None:
     for key, value in ATTRACTION_TAGS:
         if tags.get(key) == value:
             return f"{key}={value}"
+    if include_jiu_jitsu and _matches_jiu_jitsu(tags):
+        sports = _sport_tokens(tags)
+        if "jiu-jitsu" in sports:
+            return "sport=jiu-jitsu"
+        if "martial_arts" in sports:
+            return "sport=martial_arts"
+        for key, value in _JIU_JITSU_HALL_TAGS:
+            if tags.get(key) == value:
+                return f"{key}={value}"
     return None
+
+
+def _interest_is_jiu_jitsu(interest: str) -> bool:
+    return _JIU_JITSU_NAME_RE.search(_fold_label(interest)) is not None
+
+
+def _fold_label(text: str) -> str:
+    return " ".join(text.casefold().replace("ё", "е").split())
+
+
+def _sport_tokens(tags: dict[str, Any]) -> set[str]:
+    raw = tags.get("sport")
+    if raw is None:
+        return set()
+    return {part.strip().casefold() for part in str(raw).split(";") if part.strip()}
+
+
+def _is_jiu_jitsu_hall(tags: dict[str, Any]) -> bool:
+    return any(tags.get(key) == value for key, value in _JIU_JITSU_HALL_TAGS)
+
+
+def _name_indicates_jiu_jitsu(tags: dict[str, Any]) -> bool:
+    blob = " ".join(
+        str(tags.get(key) or "")
+        for key in ("name", "name:en", "name:ru", "alt_name")
+    )
+    return _JIU_JITSU_NAME_RE.search(_fold_label(blob)) is not None
+
+
+def _matches_jiu_jitsu(tags: dict[str, Any]) -> bool:
+    """sport-тег сам по себе достаточен. Зал без тега — только по названию."""
+    if _sport_tokens(tags) & _JIU_JITSU_SPORTS:
+        return True
+    return _is_jiu_jitsu_hall(tags) and _name_indicates_jiu_jitsu(tags)
 
 
 # Тип места для текста агентам. Смысл имени не переводится.
@@ -245,6 +340,12 @@ _CATEGORY_RU = {
     "historic=archaeological_site": "археологический объект",
     "natural=beach": "пляж",
     "leisure=nature_reserve": "заповедник",
+    "sport=jiu-jitsu": "джиу-джитсу",
+    "sport=martial_arts": "единоборства",
+    "amenity=dojo": "додзё",
+    "leisure=fitness_centre": "фитнес-центр",
+    "leisure=sports_centre": "спортивный центр",
+    "leisure=sports_hall": "спортивный зал",
 }
 
 def place_category_label(category: str) -> str:
@@ -317,7 +418,13 @@ def _is_cyrillic_letter(char: str) -> bool:
     return "CYRILLIC" in unicodedata.name(char, "")
 
 
-def _build_query(latitude: float, longitude: float, radius_m: int) -> str:
+def _build_query(
+    latitude: float,
+    longitude: float,
+    radius_m: int,
+    *,
+    include_jiu_jitsu: bool = False,
+) -> str:
     # Компактный запрос: nwr + регулярки вместо 30 отдельных селекторов.
     # Публичный Overpass часто отдаёт 504 на тяжёлых around-запросах.
     around = f"(around:{radius_m},{latitude},{longitude})"
@@ -327,6 +434,20 @@ def _build_query(latitude: float, longitude: float, radius_m: int) -> str:
         f'  nwr["natural"="beach"]{around};',
         f'  nwr["leisure"="nature_reserve"]{around};',
     ]
+    if include_jiu_jitsu:
+        # Залы без sport-тега запрашиваем только по имени; отсев дублирует Python.
+        name_re = "jiu[- ]?jitsu|джиу[- ]?джитсу|bjj"
+        parts.append(
+            '  nwr["sport"~"^(.*;)?(jiu-jitsu|martial_arts)(;.*)?$"]'
+            f"{around};"
+        )
+        for name_key in ("name", "name:en", "name:ru", "alt_name"):
+            name = f'["{name_key}"~"{name_re}",i]'
+            parts.append(f'  nwr["amenity"="dojo"]{name}{around};')
+            parts.append(
+                '  nwr["leisure"~"^(fitness_centre|sports_centre|sports_hall)$"]'
+                f"{name}{around};"
+            )
     body = "\n".join(parts)
     return (
         "[out:json][timeout:25];\n"
@@ -521,8 +642,15 @@ def _fetch_overpass(
     longitude: float,
     radius_m: int,
     settings: OsmSettings,
+    *,
+    include_jiu_jitsu: bool = False,
 ) -> list[dict[str, Any]]:
-    query = _build_query(latitude, longitude, radius_m)
+    query = _build_query(
+        latitude,
+        longitude,
+        radius_m,
+        include_jiu_jitsu=include_jiu_jitsu,
+    )
     return run_overpass(query, settings=settings)
 
 

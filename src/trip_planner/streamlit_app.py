@@ -28,7 +28,7 @@ from trip_planner.geocode import (
     candidate_to_geocode_result,
     settlement_name,
 )
-from trip_planner.places_osm import PlacesError, search_places
+from trip_planner.places_osm import Place, PlacesError, search_places
 from trip_planner.service import PlanningError, plan_trip
 from trip_planner.trip import (
     EXPENSE_CATEGORIES,
@@ -218,10 +218,48 @@ def _show_trip_summary(trip: TripRequest) -> None:
     st.caption(" · ".join(details))
 
 
-def _check_places_without_ai(destination: GeocodeResult) -> None:
+_MARTIAL_ARTS_NOT_BJJ = (
+    "Общий тег sport=martial_arts подтверждает единоборства, "
+    "но сам по себе не доказывает, что в зале преподают именно BJJ."
+)
+
+
+def _form_interests(raw: str) -> tuple[str, ...]:
+    """Интересы из поля формы. Пустое поле не блокирует диагностику."""
+    return tuple(" ".join(part.split()) for part in raw.split(",") if part.strip())
+
+
+def _sport_tokens(place: Place) -> set[str]:
+    raw = dict(place.tags).get("sport")
+    if raw is None:
+        return set()
+    return {part.strip().casefold() for part in str(raw).split(";") if part.strip()}
+
+
+def _general_martial_arts(place: Place) -> bool:
+    """sport=martial_arts без sport=jiu-jitsu: единоборства, не доказанный BJJ."""
+    sports = _sport_tokens(place)
+    return "martial_arts" in sports and "jiu-jitsu" not in sports
+
+
+def _diagnostic_place_lines(places: list[Place]) -> list[str]:
+    lines = [f"{place.name} — {place.category}" for place in places]
+    if any(_general_martial_arts(place) for place in places):
+        lines.append(_MARTIAL_ARTS_NOT_BJJ)
+    return lines
+
+
+def _check_places_without_ai(
+    destination: GeocodeResult, interests_raw: str
+) -> None:
     """Overpass вокруг выбранного центра. Без CrewAI и без ProxyAPI."""
+    interests = _form_interests(interests_raw)
     try:
-        places = search_places(destination.latitude, destination.longitude)
+        places = search_places(
+            destination.latitude,
+            destination.longitude,
+            interests=interests,
+        )
     except PlacesError as error:
         st.error(f"Ошибка Overpass: {error.kind.value}")
         return
@@ -229,6 +267,10 @@ def _check_places_without_ai(destination: GeocodeResult) -> None:
         st.error("Не удалось прочитать настройки OSM. Секреты не показаны.")
         return
     st.success(f"Найдено мест: {len(places)}")
+    if interests:
+        st.caption("Интересы: " + ", ".join(interests))
+    if places:
+        st.text("\n".join(_diagnostic_place_lines(places)))
 
 
 def _show_selected_destination(destination: GeocodeResult) -> None:
@@ -427,6 +469,7 @@ def main() -> None:
             search_clicked = st.form_submit_button("Найти варианты")
         with plan_col:
             plan_clicked = st.form_submit_button("Составить план")
+        check_clicked = st.form_submit_button("Проверить поиск мест без AI")
 
     if search_clicked:
         _clear_plan_result()
@@ -520,10 +563,10 @@ def main() -> None:
     if route_destination is not None:
         _show_selected_destination(route_destination)
 
-    if st.button("Проверить поиск мест без AI"):
+    if check_clicked:
         if isinstance(route_destination, GeocodeResult):
             with st.spinner("Ищем места в Overpass…"):
-                _check_places_without_ai(route_destination)
+                _check_places_without_ai(route_destination, interests_raw)
         else:
             st.warning("Сначала выберите город из списка.")
 
