@@ -5,11 +5,13 @@
 
 Поиск городов — «Найти варианты». CrewAI — только «Составить план»
 после выбора города из списка.
+«Проверить поиск мест без AI» вызывает только Overpass и не запускает CrewAI.
 """
 
 import streamlit as st
 from crewai.crews.crew_output import CrewOutput
 
+from trip_planner.config import ConfigError
 from trip_planner.destination_search import (
     OVERPASS_FRIENDLY_MESSAGE,
     DestinationSearchResult,
@@ -26,6 +28,7 @@ from trip_planner.geocode import (
     candidate_to_geocode_result,
     settlement_name,
 )
+from trip_planner.places_osm import PlacesError, search_places
 from trip_planner.service import PlanningError, plan_trip
 from trip_planner.trip import (
     EXPENSE_CATEGORIES,
@@ -213,6 +216,19 @@ def _show_trip_summary(trip: TripRequest) -> None:
     if trip.housing_notes:
         details.append(f"Жильё: {trip.housing_notes}")
     st.caption(" · ".join(details))
+
+
+def _check_places_without_ai(destination: GeocodeResult) -> None:
+    """Overpass вокруг выбранного центра. Без CrewAI и без ProxyAPI."""
+    try:
+        places = search_places(destination.latitude, destination.longitude)
+    except PlacesError as error:
+        st.error(f"Ошибка Overpass: {error.kind.value}")
+        return
+    except ConfigError:
+        st.error("Не удалось прочитать настройки OSM. Секреты не показаны.")
+        return
+    st.success(f"Найдено мест: {len(places)}")
 
 
 def _show_selected_destination(destination: GeocodeResult) -> None:
@@ -503,6 +519,13 @@ def main() -> None:
     route_destination = st.session_state.get("route_destination")
     if route_destination is not None:
         _show_selected_destination(route_destination)
+
+    if st.button("Проверить поиск мест без AI"):
+        if isinstance(route_destination, GeocodeResult):
+            with st.spinner("Ищем места в Overpass…"):
+                _check_places_without_ai(route_destination)
+        else:
+            st.warning("Сначала выберите город из списка.")
 
     if "trip" in st.session_state:
         _show_trip_summary(st.session_state["trip"])
