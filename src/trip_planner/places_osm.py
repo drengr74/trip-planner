@@ -134,6 +134,14 @@ def place_matches_jiu_jitsu(place: Place) -> bool:
     return _matches_jiu_jitsu(dict(place.tags))
 
 
+def place_explicit_jiu_jitsu(place: Place) -> bool:
+    """Явный BJJ: тег sport=jiu-jitsu или имя. sport=martial_arts сам по себе не считается."""
+    tags = dict(place.tags)
+    if "jiu-jitsu" in _sport_tokens(tags):
+        return True
+    return _name_indicates_jiu_jitsu(tags)
+
+
 def search_places(
     latitude: float,
     longitude: float,
@@ -351,6 +359,26 @@ _CATEGORY_RU = {
 def place_category_label(category: str) -> str:
     """Русское имя типа OSM. Неизвестный тег не подменяется выдуманным типом."""
     return _CATEGORY_RU.get(category, category)
+
+
+def format_road_name(name: str, name_en: str = "") -> str:
+    """Имя дороги для шага OSRM.
+
+    Латиница и кириллица остаются как пришли. Для иной письменности сначала
+    name:en, если он есть: «English (исходное)». Без name:en исходное имя
+    показывается в скобках, без псевдотранслитерации.
+    """
+    original = " ".join(name.split())
+    english = " ".join(name_en.split())
+    if english:
+        if original and original.casefold() != english.casefold():
+            return f"{english} ({original})"
+        return english
+    if original and _letter_script(original) != "other":
+        return original
+    if original:
+        return f"({original})"
+    return ""
 
 
 def place_display_name(place: Place) -> str:

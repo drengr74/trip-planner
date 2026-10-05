@@ -14,7 +14,7 @@ import sys
 from .config import ConfigError, load_osm_settings
 from .geocode import GeocodeError, geocode_city
 from .places_osm import PlacesError, search_places
-from .routes_osrm import RoutesError, travel_time
+from .routes_osrm import RoutesError, format_osrm_measures, travel_time
 
 # Учебный город для ручной проверки цепочки Nominatim → Overpass → OSRM.
 _CHECK_CITY = "Краби"
@@ -58,11 +58,9 @@ def main() -> None:
             sample.longitude,
             settings=settings,
         )
-        minutes = route.duration_seconds / 60.0
-        km = route.distance_meters / 1000.0
         print(
-            f"OSRM driving до места: {km:.1f} км, "
-            f"около {minutes:.0f} мин ({route.label})"
+            "OSRM driving до места:\n"
+            + format_osrm_measures(route.duration_seconds, route.distance_meters)
         )
     except (ConfigError, GeocodeError, PlacesError, RoutesError) as error:
         print(error.message)

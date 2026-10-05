@@ -1,6 +1,6 @@
 """Автомобильный маршрут через публичный OSRM (только профиль driving).
 
-Возвращает длительность и расстояние с пометкой «оценка на авто по OSRM».
+Возвращает длительность и расстояние с пометкой «расчётная оценка на авто по OSRM».
 При недоступности сервера или отсутствии маршрута время не выдумывается.
 """
 
@@ -18,7 +18,7 @@ from .config import OsmSettings, load_osm_settings
 from .osm_http import urlopen
 
 DRIVING_PROFILE = "driving"
-ROUTE_SOURCE_LABEL = "оценка на авто по OSRM"
+ROUTE_SOURCE_LABEL = "расчётная оценка на авто по OSRM"
 
 
 class RoutesError(Exception):
@@ -30,11 +30,43 @@ class RoutesError(Exception):
 
 
 @dataclass(frozen=True)
+class RoadStep:
+    """Название, номер и name:en одного шага OSRM. ref не переписывается."""
+
+    name: str
+    ref: str
+    name_en: str = ""
+
+
+@dataclass(frozen=True)
 class RouteEstimate:
-    duration_seconds: float
-    distance_meters: float
+    duration_seconds: float | None
+    distance_meters: float | None
     profile: str
     label: str
+    roads: tuple[RoadStep, ...] = ()
+
+
+def format_osrm_measures(
+    duration_seconds: float | None,
+    distance_meters: float | None,
+) -> str:
+    """Время и расстояние отдельными подписями. Нет значения — нет строки.
+
+    Километры не называются временем. Оба числа — расчётная оценка.
+    """
+    lines: list[str] = []
+    if duration_seconds is not None:
+        minutes = duration_seconds / 60.0
+        lines.append(
+            f"Расчётное время: {minutes:.0f} мин ({ROUTE_SOURCE_LABEL})."
+        )
+    if distance_meters is not None:
+        kilometers = distance_meters / 1000.0
+        lines.append(
+            f"Расстояние: {kilometers:.1f} км ({ROUTE_SOURCE_LABEL})."
+        )
+    return "\n".join(lines)
 
 
 def travel_time(
@@ -44,8 +76,13 @@ def travel_time(
     end_longitude: float,
     *,
     settings: OsmSettings | None = None,
+    steps: bool = False,
 ) -> RouteEstimate:
-    """Оценка пути на автомобиле между двумя точками через OSRM driving."""
+    """Оценка пути на автомобиле между двумя точками через OSRM driving.
+
+    steps=True запрашивает дорожные шаги только у этого маршрута.
+    Обычный расчёт до точки дня шаги не запрашивает.
+    """
     _validate_coordinates(start_latitude, start_longitude, "начала")
     _validate_coordinates(end_latitude, end_longitude, "конца")
     resolved = load_osm_settings() if settings is None else settings
@@ -55,6 +92,7 @@ def travel_time(
         end_latitude,
         end_longitude,
         resolved,
+        steps=steps,
     )
     return _parse_route(payload)
 
@@ -66,18 +104,28 @@ def _validate_coordinates(latitude: float, longitude: float, what: str) -> None:
         raise RoutesError(f"Координаты {what} вне допустимого диапазона.")
 
 
+def _route_query(*, steps: bool) -> str:
+    """overview=false всегда. steps=true только если его явно запросили."""
+    params = {"overview": "false"}
+    if steps:
+        params["steps"] = "true"
+    return urllib.parse.urlencode(params)
+
+
 def _fetch_route(
     start_latitude: float,
     start_longitude: float,
     end_latitude: float,
     end_longitude: float,
     settings: OsmSettings,
+    *,
+    steps: bool = False,
 ) -> dict[str, Any]:
     # OSRM принимает координаты в порядке lon,lat.
     coordinates = (
         f"{start_longitude},{start_latitude};{end_longitude},{end_latitude}"
     )
-    query = urllib.parse.urlencode({"overview": "false"})
+    query = _route_query(steps=steps)
     url = (
         f"{settings.osrm_url}/route/v1/{DRIVING_PROFILE}/"
         f"{coordinates}?{query}"
@@ -149,25 +197,74 @@ def _parse_route(payload: dict[str, Any]) -> RouteEstimate:
         raise RoutesError(
             "Некорректный маршрут в ответе OSRM. Время в пути не оценивалось."
         )
-    try:
-        duration = float(first["duration"])
-        distance = float(first["distance"])
-    except (KeyError, TypeError, ValueError) as error:
+    duration = _optional_measure(first.get("duration"))
+    distance = _optional_measure(first.get("distance"))
+    if duration is None and distance is None:
         raise RoutesError(
-            "В ответе OSRM нет длительности или расстояния. "
-            "Время в пути не оценивалось."
-        ) from error
-    if not math.isfinite(duration) or not math.isfinite(distance):
-        raise RoutesError(
-            "OSRM вернул некорректные числа. Время в пути не оценивалось."
-        )
-    if duration < 0 or distance < 0:
-        raise RoutesError(
-            "OSRM вернул отрицательные значения. Время в пути не оценивалось."
+            "В ответе OSRM нет длительности и расстояния. "
+            "Время и километры не оценивались."
         )
     return RouteEstimate(
         duration_seconds=duration,
         distance_meters=distance,
         profile=DRIVING_PROFILE,
         label=ROUTE_SOURCE_LABEL,
+        roads=_parse_roads(first),
     )
+
+
+def _optional_measure(value: object) -> float | None:
+    """Конечное неотрицательное число. Нет поля или мусор — значение отсутствует."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _parse_roads(route: dict[str, Any]) -> tuple[RoadStep, ...]:
+    """Непустые name и ref. Соседние шаги с той же парой склеиваются, порядок сохраняется.
+
+    Одинаковая пара после другой дороги остаётся отдельной строкой.
+    Разные name или ref не объединяются. ref не переписывается.
+    """
+    legs = route.get("legs")
+    if not isinstance(legs, list):
+        return ()
+    seen: list[RoadStep] = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        steps = leg.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            name = _step_text(step.get("name"))
+            ref = _ref_text(step.get("ref"))
+            name_en = _step_text(step.get("name:en"))
+            if not name and not ref and not name_en:
+                continue
+            current = RoadStep(name=name, ref=ref, name_en=name_en)
+            if seen and seen[-1] == current:
+                continue
+            seen.append(current)
+    return tuple(seen)
+
+
+def _step_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
+def _ref_text(value: object) -> str:
+    """ref как в ответе OSRM: без транслитерации и без смены написания."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
