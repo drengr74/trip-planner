@@ -159,3 +159,12 @@ def load_osm_settings() -> OsmSettings:
         osrm_url=osrm_url,
         search_radius_m=search_radius_m,
     )
+
+
+def load_tavily_api_key() -> str:
+    """Ключ Tavily, если он задан. Пустая строка значит, что веб-поиск недоступен.
+
+    Значение не печатается и не попадает в сообщения об ошибках.
+    """
+    _load_env()
+    return _config_value("TAVILY_API_KEY")
